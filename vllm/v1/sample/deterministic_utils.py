@@ -3,8 +3,16 @@
 """
 Deterministic sampling utilities for cross-platform reproducibility.
 
-This module provides a portable, fully-specified RNG based on SHA256
-that produces identical sequences across Python and Go implementations.
+This module provides:
+1. A portable, fully-specified RNG based on SHA256 that produces identical
+   sequences across Python and Go implementations.
+2. A decimal-arithmetic pipeline that converts logprob strings to integer
+   weights, guaranteeing bit-identical results on any CPython 3.3+ machine.
+
+The decimal context (prec=10, ROUND_HALF_EVEN) is applied *locally* inside
+the pipeline functions via ``localcontext()`` -- importing this module does
+NOT mutate the process-wide default Decimal context. See
+docs/adr/0002-localize-decimal-context.md.
 """
 
 from __future__ import annotations
@@ -13,7 +21,11 @@ import bisect
 import hashlib
 import struct
 from dataclasses import dataclass
-from typing import List, Sequence
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from typing import Dict, List, Optional, Sequence
+
+# Scale factor for integer weight quantization (2^16 = 65536).
+WEIGHT_SCALE = 2**16
 
 
 def _u64_be(x: int) -> bytes:
@@ -173,3 +185,161 @@ def sample_sequence(
     """
     rng = Sha256CounterRNG.from_seed_string(seed)
     return [sample_categorical(step_probs, rng) for step_probs in probs_2d]
+
+
+# =============================================================================
+# Decimal Pipeline: logprob strings -> integer weights
+#
+# The decimal context is applied locally via ``localcontext()`` so importing
+# this module never mutates the process-wide default (ADR 0002). All Decimal
+# arithmetic in the pipeline must run inside the ``with`` block; anything left
+# outside would fall back to the default precision and break reproducibility.
+# =============================================================================
+
+def logprobs_to_weights(
+    logprob_strings: Dict[str, str],
+    temperature: str,
+    top_p: Optional[str] = None,
+    top_k: Optional[int] = None,
+    min_p: Optional[str] = None,
+) -> Dict[str, int]:
+    """
+    Deterministic logprobs -> integer weights pipeline.
+
+    Both executor and validator call this with identical inputs. Produces
+    bit-identical results on any machine running CPython 3.3+ (backed by
+    libmpdec with IEEE 754-2008 decimal arithmetic).
+
+    All token iteration uses a fixed order: sorted by token ID string
+    (lexicographic). This eliminates accumulation-order ambiguity in Decimal
+    sums.
+
+    Note (see MERGE-PLAN §8 U12): the final weight list order and residual
+    tie-break both rely on this lexicographic order. The executor production
+    path must build its weight list in the *same* order for Check 2 to agree.
+
+    Args:
+        logprob_strings: {token_id_str: logprob_str} -- post-penalty logprobs
+            as string values (e.g. {"791": "-0.05000000074505806"}).
+        temperature: Temperature as string (e.g. "0.7"). Must be > 0.
+        top_p: Optional nucleus sampling threshold as string (e.g. "0.9").
+        top_k: Optional top-k filter count.
+        min_p: Optional min-p threshold as string (e.g. "0.05").
+
+    Returns:
+        {token_id_str: int_weight} -- integer weights summing to exactly
+        WEIGHT_SCALE (2^16 = 65536).
+    """
+    with localcontext() as ctx:
+        # prec=10 gives ~3 guard digits beyond float32's ~7 significant
+        # digits; ROUND_HALF_EVEN is the IEEE 754-2008 default.
+        ctx.prec = 10
+        ctx.rounding = ROUND_HALF_EVEN
+
+        T = Decimal(temperature)
+        sorted_tids = sorted(logprob_strings.keys())
+
+        # Temperature scaling
+        scaled = {tid: Decimal(logprob_strings[tid]) / T for tid in sorted_tids}
+
+        # Softmax with log-sum-exp stability shift
+        max_val = max(scaled[tid] for tid in sorted_tids)
+        exps = {tid: (scaled[tid] - max_val).exp() for tid in sorted_tids}
+        total_exp = sum(exps[tid] for tid in sorted_tids)
+        probs = {tid: exps[tid] / total_exp for tid in sorted_tids}
+
+        # top_k filtering
+        if top_k is not None and top_k < len(sorted_tids):
+            top_k_tids = sorted(
+                sorted_tids, key=lambda t: probs[t], reverse=True
+            )[:top_k]
+            probs = {tid: probs[tid] for tid in top_k_tids}
+            sorted_tids = sorted(top_k_tids)
+
+        # top_p filtering
+        if top_p is not None:
+            tp = Decimal(top_p)
+            sorted_by_prob = sorted(
+                sorted_tids, key=lambda t: probs[t], reverse=True
+            )
+            cumsum = Decimal(0)
+            kept: List[str] = []
+            for tid in sorted_by_prob:
+                cumsum += probs[tid]
+                kept.append(tid)
+                if cumsum >= tp:
+                    break
+            probs = {tid: probs[tid] for tid in kept}
+            sorted_tids = sorted(kept)
+
+        # min_p filtering
+        if min_p is not None:
+            mp = Decimal(min_p)
+            max_prob = max(probs[tid] for tid in sorted_tids)
+            threshold = max_prob * mp
+            kept = [tid for tid in sorted_tids if probs[tid] >= threshold]
+            if not kept:
+                kept = [max(sorted_tids, key=lambda t: probs[t])]
+            probs = {tid: probs[tid] for tid in kept}
+            sorted_tids = sorted(kept)
+
+        # Re-normalize after filtering
+        kept_total = sum(probs[tid] for tid in sorted_tids)
+        norm_probs = {tid: probs[tid] / kept_total for tid in sorted_tids}
+
+        # Quantize to integer weights
+        d_scale = Decimal(WEIGHT_SCALE)
+        weights = {
+            tid: int((norm_probs[tid] * d_scale).to_integral_value())
+            for tid in sorted_tids
+        }
+
+        # Fix total to exactly WEIGHT_SCALE (deterministic residual
+        # assignment). Ties broken by token ID string (lexicographic).
+        residual = WEIGHT_SCALE - sum(weights.values())
+        max_tid = max(sorted_tids, key=lambda t: (weights[t], t))
+        weights[max_tid] += residual
+
+    return weights
+
+
+def decimal_sample_from_logprobs(
+    logprob_strings: Dict[str, str],
+    rng: Sha256CounterRNG,
+    temperature: str,
+    top_p: Optional[str] = None,
+    top_k: Optional[int] = None,
+    min_p: Optional[str] = None,
+) -> str:
+    """
+    Full decimal pipeline + sample: logprob strings -> sampled token ID.
+
+    Calls logprobs_to_weights() to derive integer weights, then
+    sample_categorical_weights() to pick a token. Returns the sampled token ID
+    as a string.
+
+    The weight list is built in lexicographic token-ID-string order; the
+    returned index maps back through the same order (see MERGE-PLAN §8 U12).
+
+    Args:
+        logprob_strings: {token_id_str: logprob_str}
+        rng: SHA256 counter-mode RNG (state is advanced by one sample).
+        temperature: Temperature as string (e.g. "0.7").
+        top_p: Optional nucleus sampling threshold as string.
+        top_k: Optional top-k filter count.
+        min_p: Optional min-p threshold as string.
+
+    Returns:
+        Sampled token ID as string (e.g. "791").
+    """
+    weights = logprobs_to_weights(
+        logprob_strings, temperature,
+        top_p=top_p, top_k=top_k, min_p=min_p,
+    )
+
+    # Build parallel lists in deterministic order (sorted by token ID string).
+    sorted_tids = sorted(weights.keys())
+    weight_list = [weights[tid] for tid in sorted_tids]
+
+    idx = sample_categorical_weights(weight_list, rng)
+    return sorted_tids[idx]

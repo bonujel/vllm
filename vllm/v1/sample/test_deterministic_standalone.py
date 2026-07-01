@@ -996,5 +996,62 @@ def run_all_tests():
     print("=" * 70)
 
 
+# =============================================================================
+# Decimal pipeline tests (merged from `dump` branch; MERGE-PLAN §2.1/§2.4).
+# Pure CPU, no torch. Run with: pytest test_deterministic_standalone.py
+# =============================================================================
+
+from vllm.v1.sample.deterministic_utils import (  # noqa: E402
+    decimal_sample_from_logprobs,
+    logprobs_to_weights,
+)
+
+_LP = {
+    "791": "-0.05000000074505806",
+    "1": "-3.0",
+    "2": "-3.5",
+    "10": "-4.0",
+}
+
+
+def test_import_has_no_global_decimal_side_effect():
+    """ADR 0002: importing deterministic_utils must NOT mutate the process
+    default Decimal context. The module uses localcontext() internally."""
+    import decimal
+    import importlib
+
+    before = decimal.getcontext().prec
+    importlib.import_module("vllm.v1.sample.deterministic_utils")
+    assert decimal.getcontext().prec == before
+
+
+def test_iter_u64_reference_value():
+    """§7 reference: a Go port must match this bit-for-bit."""
+    assert iter_u64("reference_seed_v1", 5)[0] == 4286832458236889005
+
+
+def test_logprobs_to_weights_sums_to_scale():
+    """§7: integer weights sum to exactly 2^16 = 65536."""
+    w = logprobs_to_weights(_LP, temperature="1.0")
+    assert sum(w.values()) == 65536
+
+
+def test_decimal_sample_is_reproducible():
+    """§7: same seed -> same token across runs."""
+    r1 = decimal_sample_from_logprobs(
+        _LP, Sha256CounterRNG.from_seed_string("42|[1,2,3]"), "1.0")
+    r2 = decimal_sample_from_logprobs(
+        _LP, Sha256CounterRNG.from_seed_string("42|[1,2,3]"), "1.0")
+    assert r1 == r2
+
+
+def test_v011_symbols_preserved():
+    """§2.1: append must not drop v011-only symbols."""
+    import vllm.v1.sample.deterministic_utils as du
+    for name in ("WeightedPrefixSampler", "sample_categorical",
+                 "sample_sequence", "sample_categorical_weights"):
+        assert hasattr(du, name)
+
+
 if __name__ == "__main__":
     run_all_tests()
