@@ -224,8 +224,9 @@ def verify_sampling_sequence(
         if token.sampling_weights is None:
             continue
         
-        # Get sorted weights (consistent ordering)
-        sorted_items = sorted(token.sampling_weights.items(), key=lambda x: int(x[0]))
+        # Sort by token-ID string, not numeric: contract §3 order. A numeric key
+        # would disagree ("10" < "2" as strings) and false-reject. (§8 U12)
+        sorted_items = sorted(token.sampling_weights.items(), key=lambda x: x[0])
         weight_list = [w for _, w in sorted_items]
         token_list = [t for t, _ in sorted_items]
         
