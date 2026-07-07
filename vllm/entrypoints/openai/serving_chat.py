@@ -1838,27 +1838,24 @@ class OpenAIServingChat(OpenAIServing):
         else:
             seed_str = prompt_repr
 
-        # Get temperature for weight consistency check
-        temperature = request.temperature if request.temperature else 1.0
+        # `is not None`, not falsy: temperature 0 is greedy (§7), not unspecified.
+        temperature = (request.temperature
+                       if request.temperature is not None else 1.0)
 
         try:
             result = validate_full(
-                enforced_tokens=enforced_tokens,
+                artifact=enforced_tokens,
                 validator_logprobs=validator_logprobs_list,
                 seed_str=seed_str,
                 temperature=temperature,
             )
             return result
         except Exception as e:
-            logger.warning("Validation failed with error: %s", e)
-            # Return a result indicating validation error
-            return ValidationResult(
-                fraud=False,
-                distance=0.0,
-                correct_raw_logprobs=True,
-                correct_processed_logprobs=True,
-                correct_sampling=True,
-            )
+            # A validator-side error yields no verdict, never a silent pass/fail
+            # about the executor. See result_for_validator_error (#1199).
+            from vllm.validation_sampling import result_for_validator_error
+            logger.warning("Validation produced no verdict: %s", e)
+            return result_for_validator_error(e)
 
     def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest):
         """
