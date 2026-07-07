@@ -178,6 +178,32 @@ def build() -> Dict:
             },
         ],
         "cases": [_run_case(c) for c in _CASES],
+        # Chain-bound seed derivation (gonka-ai/vllm#56). Independently versioned
+        # via its own domain tag; the Go validator must reproduce these digests
+        # and reject the same invalid inference ids.
+        "seed_derivation": {
+            "domain_tag": du._SEED_DOMAIN_TAG,
+            "accept": [
+                {"user_seed": us, "inference_id": iid,
+                 "expected_seed": du.derive_chain_bound_seed(us, iid)}
+                for us, iid in [
+                    (7, "chain-abc"),               # pinned golden vector
+                    (7, "chain-xyz"),               # domain separation vs above
+                    (42, "devshard-escrow1-100"),   # devshard-style id
+                    (-1, "chain-abc"),              # negative seed
+                    (2**63 - 1, "x"),               # int64 max boundary
+                ]
+            ],
+            # Must fail closed on both sides (Go seed is int64, so only the
+            # inference-id rules are cross-language-relevant here).
+            "reject_inference_id": [
+                {"inference_id": "", "reason": "empty"},
+                {"inference_id": " chain-abc ", "reason": "whitespace (space is 0x20, below 0x21)"},
+                {"inference_id": "chain\tabc", "reason": "control char (tab)"},
+                {"inference_id": "chain-é", "reason": "non-ASCII"},
+                {"inference_id": "x" * 257, "reason": "too long (>256)"},
+            ],
+        },
     }
     return doc
 
