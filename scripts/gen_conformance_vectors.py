@@ -153,6 +153,12 @@ def _run_case(case: Dict) -> Dict:
     return out
 
 
+def _iter_uint64_below(seed: str, n: int, count: int) -> list:
+    """A sequence of unbiased [0, n) draws from a fresh RNG (contract §6)."""
+    rng = du.Sha256CounterRNG.from_seed_string(seed)
+    return [du.uint64_below(rng, n) for _ in range(count)]
+
+
 def build() -> Dict:
     rng_ref_seed = "reference_seed_v1"
     doc = {
@@ -178,11 +184,25 @@ def build() -> Dict:
             },
         ],
         "cases": [_run_case(c) for c in _CASES],
+        # Unbiased categorical draw (contract §6). The pipeline always produces
+        # weights summing to 2^16 (a power of 2), so uint64_below never rejects
+        # there; these non-power-of-2 moduli exercise the limit + modulo path and
+        # pin it cross-language.
+        "uint64_below": {
+            "seed": rng_ref_seed,
+            "count": 8,
+            "cases": [
+                {"n": n, "draws": _iter_uint64_below(rng_ref_seed, n, 8)}
+                for n in [3, 10, 1000, 65537, 999983]
+            ],
+        },
         # Chain-bound seed derivation (gonka-ai/vllm#56). Independently versioned
         # via its own domain tag; the Go validator must reproduce these digests
         # and reject the same invalid inference ids.
         "seed_derivation": {
-            "domain_tag": du._SEED_DOMAIN_TAG,
+            # Pinned contract value (must match deterministic_utils._SEED_DOMAIN_TAG;
+            # the accept digests below are derived through it, so drift is caught).
+            "domain_tag": "gonka-deterministic-sampling-v1",
             "accept": [
                 {"user_seed": us, "inference_id": iid,
                  "expected_seed": du.derive_chain_bound_seed(us, iid)}

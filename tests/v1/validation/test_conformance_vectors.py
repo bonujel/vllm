@@ -48,6 +48,14 @@ def test_weight_scale_matches_contract():
     assert VECTORS["weight_scale"] == du.WEIGHT_SCALE == 65536
 
 
+def test_uint64_below_vectors():
+    ub = VECTORS["uint64_below"]
+    for case in ub["cases"]:
+        rng = du.Sha256CounterRNG.from_seed_string(ub["seed"])
+        got = [du.uint64_below(rng, case["n"]) for _ in case["draws"]]
+        assert got == case["draws"], case["n"]
+
+
 def test_rng_reference_vector():
     ref = VECTORS["rng_reference"]
     assert du.iter_u64(ref["seed"], len(ref["first_u64"])) == ref["first_u64"]
